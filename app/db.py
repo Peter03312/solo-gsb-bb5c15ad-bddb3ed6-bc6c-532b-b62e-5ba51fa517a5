@@ -17,10 +17,13 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY,
-    username    TEXT NOT NULL UNIQUE,
-    key_hash    TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    id             INTEGER PRIMARY KEY,
+    username       TEXT NOT NULL UNIQUE,   -- 同名不可重注册：停用行保留，唯一约束继续生效
+    key_hash       TEXT NOT NULL,          -- 停用后覆盖为随机不可用值，任何旧密钥均不再匹配
+    status         TEXT NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'deactivated')),
+    deactivated_at TEXT,                   -- 停用生效时刻；active 账号为 NULL
+    created_at     TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -216,6 +219,13 @@ ALTER TABLE open_requests_new RENAME TO open_requests;
 CREATE INDEX IF NOT EXISTS idx_open_requests_document ON open_requests(document_id);
 """
 
+# 旧库迁移（幂等）：users 增加 status/deactivated_at（账号停用），
+# 旧库无此两列时补列；默认 active 与既有 CHECK 约束行为不变。
+_USERS_MIGRATION_ADD_COLUMNS = [
+    ("status", "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+    ("deactivated_at", "ALTER TABLE users ADD COLUMN deactivated_at TEXT"),
+]
+
 # 旧库迁移（幂等）：documents 的 CHECK 约束不含 purged 时重建表
 # （purge_at / purged_at 两列先由 ALTER TABLE 补齐，重建时随数据一并搬移）
 _MIGRATION_REBUILD_DOCUMENTS = """
@@ -242,6 +252,13 @@ def init_db(db_path: str | None = None) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # users 旧库迁移：补 status / deactivated_at 两列（账号停用）。
+        # CREATE TABLE IF NOT EXISTS 不会更新既有表结构；补列带常量默认值，
+        # 既有账号全部视为 active，行为不变。
+        user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        for col, ddl in _USERS_MIGRATION_ADD_COLUMNS:
+            if col not in user_cols:
+                conn.execute(ddl)
         # 旧版库迁移：CREATE TABLE IF NOT EXISTS 不会更新既有表结构
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(open_requests)")}
         if "earliest_open_at" not in cols:
