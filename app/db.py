@@ -17,10 +17,13 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY,
-    username    TEXT NOT NULL UNIQUE,
-    key_hash    TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    id             INTEGER PRIMARY KEY,
+    username       TEXT NOT NULL UNIQUE,
+    key_hash       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active', 'deactivated')),
+    deactivated_at TEXT,                          -- 可空：停用生效时刻（UTC）
+    created_at     TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -270,6 +273,14 @@ def init_db(db_path: str | None = None) -> None:
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.executescript(_MIGRATION_REBUILD_DOCUMENTS)
             conn.execute("PRAGMA foreign_keys=ON")
+        # users 迁移：补 status / deactivated_at 列（旧库无账号停用能力）
+        user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        if "status" not in user_cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "deactivated_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN deactivated_at TEXT")
         conn.commit()
     finally:
         conn.close()

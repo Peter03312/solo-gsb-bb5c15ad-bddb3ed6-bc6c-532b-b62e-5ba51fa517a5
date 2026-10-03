@@ -79,6 +79,24 @@
   发起/确认/撤回的截止判定以取得写锁后的实际时刻为准：等待写锁期间越过
   截止时刻的，发起沿用 400 且不落提案，确认/撤回先使提案失效并清空正文
   再沿用 409，不计新票、不生成资料或封存审计。
+- 账号持有人可凭当前 X-API-Key 申请停用账号（POST /me/deactivation）。停用
+  临界区先按现有规则做一轮全局到点结算（到点开封、到期清除、开封请求到期、
+  交接邀请逾期、预封存提案逾期），结算随事务提交落库——即使随后拒绝停用，
+  本次到点结算仍已落库。结算后若本人仍有未了义务（任一未清除资料的封存人、
+  任一未开封资料的当前见证人、任一待确认预封存的发起人/受邀见证人、任一待
+  确认交接的受让人），拒绝停用（409）并返回每项义务的类型、对象编号与原因，
+  账号保持可用；义务全部结清则账号立即停用：当前密钥永久失效（key_hash 覆
+  盖为不可匹配值并置 status=deactivated），之后该密钥的一切访问沿用现有
+  无效密钥 401（不区分账号是否存在），同名不可重新注册（用户名唯一约束保留，
+  沿用 409）；历史审计、通知与参与记录全部保留（停用只追加一条 account_deactivated
+  审计，不删除任何行）。停用后其他账号不得再把该账号指定为见证人、交接受让人
+  或预封存受邀见证人——按现有“无效参与人”错误处理（封存/预封存 400 “尚未
+  注册”、替换新见证人 400 “尚未注册”、交接受让人 400 “尚未注册”，文案与
+  未注册一致，不暴露停用状态）。停用与封存、替换、交接、预封存、密钥轮换
+  并发时全部按 BEGIN IMMEDIATE 写事务提交顺序裁定：停用先提交则并发角色
+  指定在锁内复查到该账号已停用而按上述既有错误拒绝回滚，并发业务写持有的
+  旧密钥复核失败按既有 401 回滚；业务写先提交则新增角色可能构成义务，停用
+  随后在同一串行顺序下被拒绝；不存在“停用后新增角色”或部分停用。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
@@ -591,6 +609,45 @@ def expire_due_pre_seal_proposals(
     return len(rows)
 
 
+def settle_all_due(tx: sqlite3.Connection, now: str) -> int:
+    """在已持有的写事务内按与后台扫描器完全相同的顺序做一轮全局到点结算。
+
+    顺序固定为：到点开封 -> 到期清除 -> 开封请求到期 -> 交接邀请逾期 ->
+    预封存提案逾期（并清空逾期提案正文）。返回失效（expired）的开封请求数。
+    账号停用临界区先调用本函数：即便随后因未了义务拒绝停用，本次结算也已随
+    该事务提交落库（“到点结算仍落库”）。
+    """
+    # 第一步：到点开封（清除优先的 waiting 请求不在此开封）。
+    resolve_due_waiting(tx, now)
+    # 第二步：到清除时刻的资料清空正文（purged），其进行中请求、
+    # 旧同意与待确认交接邀请在 purge_document_now 内一并结算。
+    purge_due_documents(tx, now)
+    # 第三步：到截止时刻仍未集齐两票（pending）的请求失效。
+    rows = tx.execute(
+        "SELECT id, document_id FROM open_requests"
+        " WHERE status = 'pending' AND deadline <= ?",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        tx.execute(
+            "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        add_audit(
+            tx,
+            actor_id=None,
+            action="request_expired",
+            document_id=row["document_id"],
+            request_id=row["id"],
+            detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
+        )
+    # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
+    expire_due_invitations(tx, now)
+    # 第五步：过确认截止时刻仍待确认的预封存提案失效并清空提案正文。
+    expire_due_pre_seal_proposals(tx, now)
+    return len(rows)
+
+
 class ExpirySweeper:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
@@ -621,46 +678,12 @@ class ExpirySweeper:
 
     @staticmethod
     def sweep_once() -> int:
-        """一轮定时处理：先把到点的 waiting 请求开封（清除优先的不开），
-        再把到清除时刻的资料清除正文，然后把过截止时刻仍
-        pending（票数不足）的请求置为 expired，再把过确认截止时刻仍
-        pending 的交接邀请置为 expired，最后把过确认截止时刻仍 pending 的
-        预封存提案置为 expired（同时清空提案正文）；返回失效（expired）请求条数。"""
+        """一轮定时处理：顺序执行全局到点结算（见 settle_all_due 的文档）；
+        返回失效（expired）的开封请求条数。"""
         conn = connect()
         try:
             with write_tx(conn) as tx:
-                now = utc_str(now_utc())
-                # 第一步：到点开封。waiting 必然满足 earliest_open_at < deadline，
-                # 到点即生效，永远不会走到下面的过期分支。
-                resolve_due_waiting(tx, now)
-                # 第二步：到清除时刻的资料清空正文（purged）；其进行中请求、
-                # 旧同意与待确认交接邀请在 purge_document_now 内一并结算。
-                purge_due_documents(tx, now)
-                # 第三步：到截止时刻仍未集齐两票（pending）的请求失效。
-                rows = tx.execute(
-                    "SELECT id, document_id FROM open_requests"
-                    " WHERE status = 'pending' AND deadline <= ?",
-                    (now,),
-                ).fetchall()
-                for row in rows:
-                    tx.execute(
-                        "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
-                        (now, row["id"]),
-                    )
-                    add_audit(
-                        tx,
-                        actor_id=None,
-                        action="request_expired",
-                        document_id=row["document_id"],
-                        request_id=row["id"],
-                        detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
-                    )
-                # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
-                expire_due_invitations(tx, now)
-                # 第五步：过确认截止时刻仍待确认的预封存提案失效并清空提案正文
-                #（未集齐三名见证人确认即失效，不产生资料或封存审计）。
-                expire_due_pre_seal_proposals(tx, now)
-                return len(rows)
+                return settle_all_due(tx, utc_str(now_utc()))
         finally:
             conn.close()
 
@@ -683,7 +706,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -836,6 +859,179 @@ def health() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# 账号停用（account deactivation）
+#
+# 账号持有人凭当前 X-API-Key 申请停用。停用临界区先按现有规则做一轮全局到点
+# 结算（settle_all_due，与后台扫描器同一顺序）：即使随后因未了义务拒绝停用，
+# 本次结算也随事务提交落库。结算后仍有未了义务则 409 拒绝并逐项返回义务
+# （类型/对象编号/原因），账号保持可用；义务结清则账号立即停用：
+# key_hash 覆盖为不可匹配值、status 置 deactivated，当前密钥立即且永久失效，
+# 后续访问沿用无效密钥 401（不区分账号是否存在），同名不可重注册（用户名
+# 唯一约束保留，沿用 409）。历史审计、通知与参与记录全部保留，不删除任何行。
+#
+# 停用后其他账号不得再把该账号指定为见证人/交接受让人/预封存受邀见证人：
+# 各指定路径在写锁内按用户名解析参与人时只接受 status='active'，停用账号
+# 一律按现有“无效参与人”错误处理（沿用未注册的 400 与文案，不暴露停用状态）。
+# 停用与封存/替换/交接/预封存/轮换并发时，全部按 BEGIN IMMEDIATE 提交顺序
+# 裁定（详见模块文档），不会出现停用后新增角色或部分停用。
+# ---------------------------------------------------------------------------
+
+
+def collect_deactivation_obligations(
+    tx: sqlite3.Connection, user_id: int
+) -> list[dict[str, Any]]:
+    """在已持有的写事务内（全局到点结算之后）枚举本人未了义务。
+
+    义务口径（全部以结算后的当前状态为准）：
+    - 任一未清除（sealed/opened）资料的封存人；
+    - 任一未开封（sealed）资料的当前见证人；
+    - 任一待确认（pending）预封存提案的发起人或受邀见证人；
+    - 任一待确认（pending）交接邀请的受让人。
+    返回按 (type, ref_id) 稳定排序的义务清单。
+    """
+    obligations: list[dict[str, Any]] = []
+
+    for row in tx.execute(
+        "SELECT id, status FROM documents WHERE owner_id = ? AND status != 'purged'"
+        " ORDER BY id",
+        (user_id,),
+    ).fetchall():
+        obligations.append({
+            "type": "document_owner",
+            "ref_kind": "document",
+            "ref_id": row["id"],
+            "reason": (
+                "本人是未清除资料的封存人（资料未开封），须先完成交接或到点清除"
+                if row["status"] == "sealed"
+                else "本人是未清除资料的封存人（资料已开封、正文尚未到点清除），须待到点清除"
+            ),
+        })
+
+    for row in tx.execute(
+        """SELECT d.id AS id FROM document_witnesses w
+           JOIN documents d ON d.id = w.document_id
+           WHERE w.user_id = ? AND d.status = 'sealed'
+           ORDER BY d.id""",
+        (user_id,),
+    ).fetchall():
+        obligations.append({
+            "type": "document_witness",
+            "ref_kind": "document",
+            "ref_id": row["id"],
+            "reason": "本人是未开封资料的当前见证人，须待资料开封/清除或被替换后再停用",
+        })
+
+    for row in tx.execute(
+        "SELECT id FROM pre_seal_proposals WHERE owner_id = ? AND status = 'pending'"
+        " ORDER BY id",
+        (user_id,),
+    ).fetchall():
+        obligations.append({
+            "type": "pre_seal_owner",
+            "ref_kind": "pre_seal_proposal",
+            "ref_id": row["id"],
+            "reason": "本人是待确认预封存提案的发起人，须待三人确认完成、撤回或逾期后再停用",
+        })
+
+    for row in tx.execute(
+        """SELECT p.id AS id FROM pre_seal_witnesses pw
+           JOIN pre_seal_proposals p ON p.id = pw.proposal_id
+           WHERE pw.user_id = ? AND p.status = 'pending'
+           ORDER BY p.id""",
+        (user_id,),
+    ).fetchall():
+        obligations.append({
+            "type": "pre_seal_witness",
+            "ref_kind": "pre_seal_proposal",
+            "ref_id": row["id"],
+            "reason": "本人是待确认预封存提案的受邀见证人，须待提案完成、失效或被替换后再停用",
+        })
+
+    for row in tx.execute(
+        "SELECT id FROM handover_invitations WHERE to_user_id = ? AND status = 'pending'"
+        " ORDER BY id",
+        (user_id,),
+    ).fetchall():
+        obligations.append({
+            "type": "handover_assignee",
+            "ref_kind": "handover_invitation",
+            "ref_id": row["id"],
+            "reason": "本人是待确认交接邀请的受让人，须先确认、拒绝（逾期）或待邀请撤回后再停用",
+        })
+
+    obligations.sort(key=lambda o: (o["type"], o["ref_id"]))
+    return obligations
+
+
+@app.post("/me/deactivation")
+def deactivate_account(
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """账号持有人凭当前 X-API-Key 申请停用本人账号。
+
+    - 临界区先做一轮与扫描器同序的全局到点结算：即使随后拒绝停用，本次
+      到点开封/清除/失效也随事务提交落库；
+    - 结算后仍有未了义务：409 拒绝，返回逐项义务（类型/对象编号/原因），
+      账号保持可用（本次结算仍已落库）；
+    - 无未了义务：立即停用，key_hash 覆盖为不可匹配值并置
+      status='deactivated'；当前密钥自提交起永久失效，后续访问沿用无效
+      密钥 401，同名不可重注册；历史审计、通知与参与记录保留。
+    """
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with authed_write_tx(db, user) as tx:
+        now = utc_str(now_utc())
+        # 第一步：按现有规则全局到点结算（与 ExpirySweeper.sweep_once 同序）。
+        settle_all_due(tx, now)
+
+        # 第二步：以结算后的当前状态枚举未了义务。
+        obligations = collect_deactivation_obligations(tx, user["id"])
+        if obligations:
+            # 到点结算必须先落库：错误延迟到提交后再抛出（与同意/撤销同一语义）。
+            post_commit_error = HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "仍有未了义务，账号停用被拒绝；账号保持可用",
+                    "obligations": obligations,
+                },
+            )
+        else:
+            # 第三步：无未了义务 -> 立即停用。
+            # key_hash 覆盖为带前缀的不可匹配随机值：任何提交密钥的 SHA-256
+            # 摘要（64 位十六进制）都不可能等于它，认证随即与“无效密钥”完全一致。
+            tombstone = "deactivated:" + secrets.token_hex(32)
+            cur = tx.execute(
+                "UPDATE users SET status='deactivated', deactivated_at=?, key_hash=?"
+                " WHERE id=? AND status='active'",
+                (now, tombstone, user["id"]),
+            )
+            if cur.rowcount != 1:
+                # 理论不可达：authed_write_tx 已在锁内复核密钥且账号仍 active
+                raise err(401, "凭据无效")
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="account_deactivated",
+                detail=(
+                    "账号已停用：密钥即刻且永久失效，同名不可重新注册；"
+                    "历史审计、通知与参与记录保留，不再接受以该账号为见证人/"
+                    "交接受让人/预封存受邀见证人的任何指定"
+                ),
+            )
+            result = {
+                "user_id": user["id"],
+                "username": user["username"],
+                "status": "deactivated",
+                "deactivated_at": now,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 资料封存
 # ---------------------------------------------------------------------------
 
@@ -893,12 +1089,13 @@ def seal_document(
     with authed_write_tx(db, user) as tx:
         placeholders = ",".join("?" for _ in payload.witnesses)
         witness_rows = tx.execute(
-            f"SELECT id, username FROM users WHERE username IN ({placeholders})",
+            f"SELECT id, username FROM users WHERE status='active' AND username IN ({placeholders})",
             payload.witnesses,
         ).fetchall()
         found = {row["username"] for row in witness_rows}
         missing = [w for w in payload.witnesses if w not in found]
         if missing:
+            # 未注册与已停用账号按现有“无效参与人”错误同一处理：不暴露停用状态
             raise err(400, f"见证人尚未注册: {', '.join(missing)}")
         id_by_name = {row["username"]: row["id"] for row in witness_rows}
         witness_ids = [id_by_name[name] for name in payload.witnesses]
@@ -1060,12 +1257,13 @@ def create_pre_seal_proposal(
             raise err(400, "确认截止时刻必须晚于当前时间")
         placeholders = ",".join("?" for _ in payload.witnesses)
         witness_rows = tx.execute(
-            f"SELECT id, username FROM users WHERE username IN ({placeholders})",
+            f"SELECT id, username FROM users WHERE status='active' AND username IN ({placeholders})",
             payload.witnesses,
         ).fetchall()
         found = {row["username"] for row in witness_rows}
         missing = [w for w in payload.witnesses if w not in found]
         if missing:
+            # 未注册与已停用账号按现有“无效参与人”错误同一处理：不暴露停用状态
             raise err(400, f"见证人尚未注册: {', '.join(missing)}")
         id_by_name = {row["username"]: row["id"] for row in witness_rows}
         witness_ids = [id_by_name[name] for name in payload.witnesses]
@@ -1776,10 +1974,11 @@ def replace_witness(
                 raise err(404, "被替换者不在当前见证人名单中")
 
             new_user = tx.execute(
-                "SELECT id, username FROM users WHERE username = ?",
+                "SELECT id, username FROM users WHERE username = ? AND status='active'",
                 (payload.new_witness,),
             ).fetchone()
             if new_user is None:
+                # 未注册与已停用账号按现有“无效参与人”错误同一处理：不暴露停用状态
                 raise err(400, "新见证人尚未注册")
             if new_user["id"] == user["id"]:
                 raise err(400, "封存人不能同时担任见证人")
@@ -1998,10 +2197,11 @@ def create_handover_invitation(
                     raise err(403, "只有封存人可以发起交接")
 
                 to_user = tx.execute(
-                    "SELECT id, username FROM users WHERE username = ?",
+                    "SELECT id, username FROM users WHERE username = ? AND status='active'",
                     (payload.to_username,),
                 ).fetchone()
                 if to_user is None:
+                    # 未注册与已停用账号按现有“无效参与人”错误同一处理：不暴露停用状态
                     raise err(400, "受让人尚未注册")
                 if to_user["id"] == user["id"]:
                     raise err(400, "受让人不能是封存人本人")
